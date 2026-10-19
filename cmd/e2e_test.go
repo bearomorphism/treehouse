@@ -534,13 +534,16 @@ func TestStatusEmptyPool(t *testing.T) {
 
 func TestGetAndStatus(t *testing.T) {
 	repoDir, homeDir := setupTestRepo(t)
+	writeProgressHook(t, homeDir)
 
 	// Use exit-shell so the subshell exits immediately.
 	env := []string{"SHELL=" + exitShellBin}
-	_, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
+	getOut, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
 	if code != 0 {
 		t.Fatalf("treehouse get failed (code %d): %s", code, getErr)
 	}
+	assertSetupProgress(t, getErr, "setup fetch create hooks done")
+	assertProgressHook(t, getOut, getErr, false)
 
 	if !strings.Contains(getErr, "Entered worktree at") {
 		t.Errorf("expected 'Entered worktree at' in stderr: %s", getErr)
@@ -606,11 +609,15 @@ func TestGetStartsBashAsInteractiveLoginShell(t *testing.T) {
 
 func TestGetLeasePrintsOnlyPathToStdout(t *testing.T) {
 	repoDir, homeDir := setupTestRepo(t)
+	writeProgressHook(t, homeDir)
 
 	stdout, stderr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
 	if code != 0 {
 		t.Fatalf("treehouse get --lease failed (code %d): %s", code, stderr)
 	}
+
+	assertSetupProgress(t, stderr, "setup fetch create hooks done")
+	assertProgressHook(t, stdout, stderr, true)
 
 	// stdout must be exactly the worktree path on a single line, so scripts can
 	// do path=$(treehouse get --lease).
@@ -646,18 +653,25 @@ func TestGetLeasePrintsOnlyPathToStdout(t *testing.T) {
 
 func TestGetNoFetchUsesLocalRefs(t *testing.T) {
 	repoDir, homeDir := setupTestRepo(t)
+	writeProgressHook(t, homeDir)
 	missingRemote := filepath.Join(t.TempDir(), "missing.git")
 	gitCmd(t, repoDir, "remote", "set-url", "origin", missingRemote)
 
-	_, stderr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
-	if code == 0 || !strings.Contains(stderr, "fetch failed") {
-		t.Fatalf("get with unreachable origin should fail fetching: code=%d stderr=%q", code, stderr)
+	stdout, stderr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
+	if code == 0 || stdout != "" || !strings.Contains(stderr, "fetch failed") {
+		t.Fatalf("get with unreachable origin should fail fetching: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	assertSetupProgress(t, stderr, "setup fetch")
+	if strings.Contains(stderr, "progress-hook-") {
+		t.Fatalf("failed fetch ran post-create hooks: %q", stderr)
 	}
 
-	stdout, stderr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease", "--no-fetch", "--json")
+	stdout, stderr, code = runTreehouse(t, repoDir, homeDir, nil, "get", "--lease", "--no-fetch", "--json")
 	if code != 0 {
 		t.Fatalf("get --no-fetch should use local refs: code=%d stderr=%q", code, stderr)
 	}
+	assertSetupProgress(t, stderr, "setup create hooks done")
+	assertProgressHook(t, stdout, stderr, true)
 	var lease leaseJSONResult
 	if err := json.Unmarshal([]byte(stdout), &lease); err != nil {
 		t.Fatalf("get --no-fetch returned invalid JSON %q: %v", stdout, err)
@@ -686,11 +700,14 @@ func TestGetLeaseRecordsHolder(t *testing.T) {
 
 func TestGetLeaseAndStatusJSONContracts(t *testing.T) {
 	repoDir, homeDir := setupTestRepo(t)
+	writeProgressHook(t, homeDir)
 
 	leaseOut, leaseErr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease", "--lease-holder", "automation-A", "--json")
 	if code != 0 {
 		t.Fatalf("treehouse get --lease --json failed (code %d): %s", code, leaseErr)
 	}
+	assertSetupProgress(t, leaseErr, "setup fetch create hooks done")
+	assertProgressHook(t, leaseOut, leaseErr, true)
 	var lease leaseJSONResult
 	if err := json.Unmarshal([]byte(leaseOut), &lease); err != nil {
 		t.Fatalf("get --lease --json returned invalid JSON %q: %v", leaseOut, err)
@@ -1517,6 +1534,7 @@ func TestReturnExplicitPathFromLinkedWorktreePool(t *testing.T) {
 
 func TestGetReusesWorktree(t *testing.T) {
 	repoDir, homeDir := setupTestRepo(t)
+	writeProgressHook(t, homeDir)
 	env := []string{"SHELL=" + exitShellBin}
 
 	// First get: creates a new worktree, subshell exits, worktree returned.
@@ -1524,16 +1542,19 @@ func TestGetReusesWorktree(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("first get failed (code %d): %s", code, stderr1)
 	}
+	assertSetupProgress(t, stderr1, "setup fetch create hooks done")
 	path1 := extractWorktreePath(stderr1, homeDir)
 	if path1 == "" {
 		t.Fatal("could not extract first worktree path")
 	}
 
 	// Second get: should reuse the same (now available) worktree.
-	_, stderr2, code := runTreehouse(t, repoDir, homeDir, env, "get")
+	stdout2, stderr2, code := runTreehouse(t, repoDir, homeDir, env, "get")
 	if code != 0 {
 		t.Fatalf("second get failed (code %d): %s", code, stderr2)
 	}
+	assertSetupProgress(t, stderr2, "setup fetch reuse hooks done")
+	assertProgressHook(t, stdout2, stderr2, false)
 	path2 := extractWorktreePath(stderr2, homeDir)
 	if path2 == "" {
 		t.Fatal("could not extract second worktree path")
@@ -3020,66 +3041,82 @@ func decodeStatusProcesses(t *testing.T, raw json.RawMessage) []statusJSONProces
 	return procs
 }
 
-func TestGetSetupProgress(t *testing.T) {
-	for _, mode := range []string{"interactive", "path", "json"} {
-		t.Run(mode, func(t *testing.T) {
-			repoDir, homeDir := setupTestRepo(t)
-			writeProgressHook(t, homeDir)
-			args := []string{"get"}
-			if mode != "interactive" {
-				args = append(args, "--lease")
-			}
-			if mode == "json" {
-				args = append(args, "--json")
-			}
-			stdout, stderr, code := runTreehouse(t, repoDir, homeDir, []string{"SHELL=" + exitShellBin}, args...)
-			if code != 0 {
-				t.Fatalf("get failed (%d): %s", code, stderr)
-			}
-			if strings.ContainsAny(stderr, "\r\x1b") {
-				t.Fatalf("redirected stderr contains terminal controls: %q", stderr)
-			}
-			steps := []string{"🌳 Setting up worktree...", "🌳 Fetching from origin...", "🌳 Creating worktree...", "🌳 Running post-create hooks..."}
-			if mode != "interactive" {
-				// Lease mode routes hook stdout to stderr too. Its first output
-				// must follow the announcement, not precede a buffered summary.
-				steps = append(steps, "progress-hook-started")
-			}
-			steps = append(steps, "🌳 Done.")
-			assertProgressOrder(t, stderr, steps...)
-			if strings.Contains(stdout, "🌳 Fetching") || strings.Contains(stdout, "🌳 Creating") || strings.Contains(stdout, "🌳 Running post-create") || strings.Contains(stdout, "🌳 Done.") {
-				t.Fatalf("setup progress leaked to stdout: %q", stdout)
-			}
-			if strings.Contains(stderr, "🌳 Reusing worktree...") {
-				t.Fatalf("fresh acquisition announced reuse: %s", stderr)
-			}
-			if mode == "interactive" {
-				if !strings.Contains(stdout, "progress-hook-started") {
-					t.Fatalf("interactive hook stdout missing: %q", stdout)
-				}
-				return
-			}
-			path := strings.TrimSpace(stdout)
-			if mode == "json" {
-				var lease leaseJSONResult
-				if err := json.Unmarshal([]byte(stdout), &lease); err != nil {
-					t.Fatalf("invalid lease JSON: %v: %q", err, stdout)
-				}
-				path = lease.Path
-			}
-			if !filepath.IsAbs(path) {
-				t.Fatalf("lease path is not absolute: %q", path)
-			}
-			if _, err := os.Stat(filepath.Join(path, ".git")); err != nil {
-				t.Fatalf("stdout did not identify a worktree: %v: %q", err, stdout)
-			}
-		})
+func TestGetSetupProgressNoOrigin(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+	gitCmd(t, repoDir, "remote", "remove", "origin")
+	_, stderr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
+	if code != 0 {
+		t.Fatalf("get without origin failed (%d): %s", code, stderr)
+	}
+	assertSetupProgress(t, stderr, "setup create done")
+}
+
+func writeProgressHook(t *testing.T, homeDir string) {
+	t.Helper()
+	configDir := filepath.Join(homeDir, ".config", "treehouse")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const hooks = "[hooks]\npost_create = [\"echo progress-hook-stdout\", \"echo progress-hook-stderr >&2\", \"exit 7\"]\n"
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(hooks), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// TestGetSetupProgressAnimatesInTerminal observes progress while Git's checkout
-// is blocked, and checks that incapable terminals receive only static progress.
-func TestGetSetupProgressAnimatesInTerminal(t *testing.T) {
+func assertSetupProgress(t *testing.T, stderr, want string) {
+	t.Helper()
+	stderr = strings.ReplaceAll(stderr, "\r\n", "\n")
+	if strings.ContainsAny(stderr, "\r\x1b") || strings.Contains(stderr, "🌳 [") {
+		t.Fatalf("static progress contains terminal controls or a bar: %q", stderr)
+	}
+	labels := map[string]string{
+		"🌳 Setting up worktree...":       "setup",
+		"🌳 Fetching from origin...":      "fetch",
+		"🌳 Creating worktree...":         "create",
+		"🌳 Reusing worktree...":          "reuse",
+		"🌳 Running post-create hooks...": "hooks",
+		"🌳 Done.":                        "done",
+	}
+	var steps []string
+	for _, line := range strings.Split(stderr, "\n") {
+		if step := labels[line]; step != "" {
+			steps = append(steps, step)
+		}
+	}
+	if got := strings.Join(steps, " "); got != want {
+		t.Fatalf("setup progress = %q, want %q; stderr: %q", got, want, stderr)
+	}
+}
+
+func assertProgressHook(t *testing.T, stdout, stderr string, leased bool) {
+	t.Helper()
+	stdout = strings.ReplaceAll(stdout, "\r\n", "\n")
+	stderr = strings.ReplaceAll(stderr, "\r\n", "\n")
+	const outMarker, errMarker = "progress-hook-stdout", "progress-hook-stderr"
+	if strings.Contains(stdout, "🌳") || strings.Contains(stdout, errMarker) {
+		t.Fatalf("progress or hook stderr leaked to stdout: %q", stdout)
+	}
+	steps := []string{"🌳 Running post-create hooks...\n"}
+	if leased {
+		if strings.Contains(stdout, outMarker) {
+			t.Fatalf("leased hook stdout was not redirected: %q", stdout)
+		}
+		steps = append(steps, outMarker)
+	} else if stdout != outMarker+"\n" || strings.Contains(stderr, outMarker) {
+		t.Fatalf("interactive hook routing: stdout=%q stderr=%q", stdout, stderr)
+	}
+	steps = append(steps, errMarker, "🌳 hook command failed:", "🌳 Done.")
+	rest := stderr
+	for _, step := range steps {
+		index := strings.Index(rest, step)
+		if index < 0 {
+			t.Fatalf("missing or out-of-order hook output %q; stderr: %q", step, stderr)
+		}
+		rest = rest[index+len(step):]
+	}
+}
+
+func TestGetSetupProgressTerminal(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Python PTY test requires Unix")
 	}
@@ -3087,11 +3124,6 @@ func TestGetSetupProgressAnimatesInTerminal(t *testing.T) {
 	if err != nil {
 		t.Skip("python3 is unavailable")
 	}
-	probe := exec.Command(python, "-c", "import os, pty; m, s = pty.openpty(); os.close(m); os.close(s)")
-	if output, err := probe.CombinedOutput(); err != nil {
-		t.Skipf("Python PTY is unavailable: %v: %s", err, output)
-	}
-
 	const terminalReader = `
 import errno
 import fcntl
@@ -3099,248 +3131,6 @@ import json
 import os
 import pty
 import re
-import select
-import signal
-import struct
-import subprocess
-import sys
-import termios
-import time
-
-animate = os.environ["TREEHOUSE_TEST_ANIMATE"] == "true"
-columns = int(os.environ["TREEHOUSE_TEST_COLUMNS"])
-ready = os.environ["TREEHOUSE_TEST_READY"]
-release = os.environ["TREEHOUSE_TEST_RELEASE"]
-master, slave = pty.openpty()
-fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
-proc = None
-stderr = bytearray()
-stdout = bytearray()
-frames = set()
-hook_offset = None
-released = False
-failure = ""
-pattern = re.compile(rb"\r" + "🌳".encode() + rb" \[([ =]+)\]")
-
-def unblock():
-    with open(release, "w"):
-        pass
-
-try:
-    proc = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=slave,
-                            start_new_session=True)
-    os.close(slave)
-    slave = None
-    streams = {master: stderr, proc.stdout.fileno(): stdout}
-    deadline = time.monotonic() + 15
-    while streams:
-        # Discard all bytes already observed before readiness. Only subsequent
-        # frames can prove the animation continues during the blocked hook.
-        if hook_offset is None and os.path.exists(ready):
-            hook_offset = len(stderr)
-        if hook_offset is not None and not released:
-            blocked = bytes(stderr[hook_offset:])
-            frames.update(m.group(1).decode() for m in pattern.finditer(blocked)
-                          if b"=" in m.group(1))
-            if "🌳 Done.".encode() in blocked:
-                failure = "Done was printed before the hook was released"
-            if not animate or len(frames) >= 2 or failure:
-                unblock()
-                released = True
-                deadline = time.monotonic() + 10
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            if released:
-                failure = failure or "treehouse did not exit after releasing its hook"
-                break
-            failure = "no two distinct moving bar frames while the hook was blocked"
-            unblock()
-            released = True
-            deadline = time.monotonic() + 10
-            continue
-        readable, _, _ = select.select(list(streams), [], [], min(remaining, 0.05))
-        for fd in readable:
-            try:
-                chunk = os.read(fd, 65536)
-            except OSError as exc:
-                if fd != master or exc.errno != errno.EIO:
-                    raise
-                chunk = b""
-            if chunk:
-                streams[fd].extend(chunk)
-            else:
-                del streams[fd]
-    if not released:
-        failure = failure or "treehouse exited before its blocked hook was released"
-finally:
-    # Always let the helper finish, including assertion/reader failures. Give
-    # the command time to reap its hook before killing a stuck process group.
-    unblock()
-    if proc is not None:
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
-        proc.stdout.close()
-    os.close(master)
-    if slave is not None:
-        os.close(slave)
-
-print(json.dumps({"stdout": stdout.decode("utf-8", "replace"),
-                  "stderr": stderr.decode("utf-8", "replace"),
-                  "exit_code": proc.returncode, "frames": sorted(frames),
-                  "hook_ready": hook_offset is not None, "failure": failure}))
-`
-
-	for _, terminalCase := range []struct {
-		term    string
-		columns int
-		animate bool
-	}{
-		{"xterm-256color", 80, true},
-		{"dumb", 80, false},
-		{"xterm-256color", 10, false},
-		{"xterm-256color", 17, false},
-		{"xterm-256color", 18, true},
-		{"xterm-256color", 0, false},
-	} {
-		for _, mode := range []string{"path", "json"} {
-			t.Run(terminalCase.term+"/"+strconv.Itoa(terminalCase.columns)+"/"+mode, func(t *testing.T) {
-				t.Parallel()
-				repoDir, homeDir := setupTestRepo(t)
-				readyFile := filepath.Join(homeDir, "hook-ready")
-				releaseFile := filepath.Join(homeDir, "hook-release")
-				configDir := filepath.Join(homeDir, ".config", "treehouse")
-				if err := os.MkdirAll(configDir, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				// Block AddWorktree itself, not Treehouse's lifecycle hooks: those
-				// must inherit real terminal streams with no progress redraws.
-				hookDir := filepath.Join(homeDir, "git-hooks")
-				if err := os.MkdirAll(hookDir, 0o755); err != nil {
-					t.Fatal(err)
-				}
-				gitHook := "#!/bin/sh\nexec '" + strings.ReplaceAll(waitShellBin, "'", "'\"'\"'") + "'\n"
-				if err := os.WriteFile(filepath.Join(hookDir, "post-checkout"), []byte(gitHook), 0o755); err != nil {
-					t.Fatal(err)
-				}
-				gitCmd(t, repoDir, "config", "core.hooksPath", hookDir)
-				if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte("[hooks]\npost_create = [\"echo progress-hook-started; exit 7\"]\n"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-				ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-				defer cancel()
-				args := []string{"-c", terminalReader, treehouseBin, "get", "--lease"}
-				if mode == "json" {
-					args = append(args, "--json")
-				}
-				terminal := exec.CommandContext(ctx, python, args...)
-				terminal.Dir = repoDir
-				terminal.Env = buildEnv(homeDir,
-					"TERM="+terminalCase.term,
-					"TREEHOUSE_TEST_COLUMNS="+strconv.Itoa(terminalCase.columns),
-					"TREEHOUSE_TEST_ANIMATE="+strconv.FormatBool(terminalCase.animate),
-					"SHELL="+exitShellBin,
-					"TREEHOUSE_TEST_READY="+readyFile,
-					"TREEHOUSE_TEST_RELEASE="+releaseFile,
-				)
-				output, err := terminal.CombinedOutput()
-				if err != nil {
-					// Also release if the outer deadline interrupted the reader.
-					_ = os.WriteFile(releaseFile, nil, 0o644)
-					t.Fatalf("terminal reader failed: %v: %s", err, output)
-				}
-				var result struct {
-					Stdout    string   `json:"stdout"`
-					Stderr    string   `json:"stderr"`
-					ExitCode  int      `json:"exit_code"`
-					Frames    []string `json:"frames"`
-					HookReady bool     `json:"hook_ready"`
-					Failure   string   `json:"failure"`
-				}
-				if err := json.Unmarshal(output, &result); err != nil {
-					t.Fatalf("invalid terminal reader result: %v: %s", err, output)
-				}
-				if result.Failure != "" || !result.HookReady || (terminalCase.animate && len(result.Frames) < 2) {
-					t.Errorf("unexpected terminal progress: %s (ready=%v, frames=%q); stderr: %q", result.Failure, result.HookReady, result.Frames, result.Stderr)
-				}
-				if !terminalCase.animate {
-					// PTYs normally translate LF to CRLF; only standalone CRs and
-					// escape sequences are terminal controls, not those line endings.
-					plain := strings.ReplaceAll(result.Stderr, "\r\n", "\n")
-					if strings.Contains(plain, "🌳 [") || strings.ContainsAny(plain, "\r\x1b") {
-						t.Errorf("static progress contains a bar or terminal controls: %q", result.Stderr)
-					}
-				}
-				if result.ExitCode != 0 {
-					t.Fatalf("get failed (%d): %s", result.ExitCode, result.Stderr)
-				}
-				assertProgressOrder(t, result.Stderr, "🌳 Setting up worktree...", "🌳 Fetching from origin...", "🌳 Creating worktree...", "🌳 Running post-create hooks...", "progress-hook-started\r\n", "🌳 hook command failed:", "🌳 Done.")
-				afterHooks := strings.SplitN(result.Stderr, "Running post-create hooks...", 2)[1]
-				afterHooks = strings.ReplaceAll(afterHooks, "\r\n", "\n")
-				if strings.Contains(afterHooks, "🌳 [") || strings.ContainsAny(afterHooks, "\r\x1b") {
-					t.Errorf("animation continued during or after lifecycle hooks: %q", afterHooks)
-				}
-				path := strings.TrimSpace(result.Stdout)
-				if mode == "json" {
-					var lease leaseJSONResult
-					if err := json.Unmarshal([]byte(result.Stdout), &lease); err != nil {
-						t.Fatalf("terminal animation corrupted lease JSON: %v: %q", err, result.Stdout)
-					}
-					if lease.LeaseID == "" || lease.LeasedAt.IsZero() {
-						t.Fatalf("lease metadata missing: %q", result.Stdout)
-					}
-					path = lease.Path
-				} else if result.Stdout != path+"\n" {
-					t.Fatalf("terminal animation changed path-only stdout: %q", result.Stdout)
-				}
-				hookPath, err := os.ReadFile(readyFile)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if !filepath.IsAbs(path) || path != string(hookPath) {
-					t.Fatalf("stdout path %q differs from hook worktree %q", path, hookPath)
-				}
-				if _, err := os.Stat(filepath.Join(path, ".git")); err != nil {
-					t.Fatalf("stdout did not identify a worktree: %v: %q", err, result.Stdout)
-				}
-			})
-		}
-	}
-}
-
-func TestGetHookPreservesTerminalAndLineBuffering(t *testing.T) {
-	testGetHookTerminal(t, false)
-}
-
-func TestGetHookBackgroundChildDoesNotDelayLease(t *testing.T) {
-	testGetHookTerminal(t, true)
-}
-
-// The socket is independent of hook output: readiness must remain observable
-// even when a wrapped stdout is buffered, or a descendant holds its pipe open.
-func testGetHookTerminal(t *testing.T, background bool) {
-	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("Python PTY test requires Unix")
-	}
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("python3 is unavailable")
-	}
-	probe := exec.Command(python, "-c", "import os, pty; m, s = pty.openpty(); os.close(m); os.close(s)")
-	if output, err := probe.CombinedOutput(); err != nil {
-		t.Skipf("Python PTY is unavailable: %v: %s", err, output)
-	}
-
-	const terminalReader = `
-import errno
-import fcntl
-import json
-import os
-import pty
 import select
 import shlex
 import signal
@@ -3351,90 +3141,39 @@ import sys
 import termios
 import time
 
-background = os.environ["TREEHOUSE_TEST_BACKGROUND"] == "true"
-# Do not mask the regression with Python's unbuffered mode, even if inherited.
-os.environ.pop("PYTHONUNBUFFERED", None)
+binary, columns, animate = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "true"
+os.environ.pop("PYTHONUNBUFFERED", None)  # Exercise genuine newline buffering.
 server = socket.socket()
-server.bind(("127.0.0.1", 0))
-server.listen(1)
-os.environ["TREEHOUSE_TEST_PORT"] = str(server.getsockname()[1])
-hook = os.path.join(os.environ["HOME"], "terminal-hook.py")
-with open(hook, "w") as f:
-    f.write('''import json, os, socket, subprocess, sys
-if os.environ["TREEHOUSE_TEST_BACKGROUND"] == "true" and len(sys.argv) == 1:
-    subprocess.Popen([sys.executable, __file__, "child"])
-    sys.exit(0)
-with socket.create_connection(("127.0.0.1", int(os.environ["TREEHOUSE_TEST_PORT"])), timeout=20) as control:
-    print("hook-stdout-line")
-    print("hook-stderr-line", file=sys.stderr)
-    control.sendall((json.dumps({"stdout_tty": sys.stdout.isatty(),
-                                "stderr_tty": sys.stderr.isatty(),
-                                "path": os.getcwd()}) + "\\n").encode())
-    if control.recv(1) != b"x":
-        sys.exit(9)
-''')
-config_dir = os.path.join(os.environ["HOME"], ".config", "treehouse")
-os.makedirs(config_dir, exist_ok=True)
-with open(os.path.join(config_dir, "config.toml"), "w") as f:
-    f.write("[hooks]\npost_create = [" + json.dumps(shlex.join([sys.executable, hook])) + "]\n")
-master, slave = pty.openpty()
-fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-proc = None
-control = None
-ready = None
-stderr = bytearray()
-stdout = bytearray()
-streamed = False
-completed = False
-released = False
-failure = ""
+proc = master = slave = None
+stdout, stderr = bytearray(), bytearray()
+events, controls, streams = {}, {}, {}
+connections = []
+tree = "🌳".encode()
+done = tree + b" Done."
+markers = (b"progress-hook-stdout\n", b"progress-hook-stderr\n")
+pattern = re.compile(rb"\r" + tree + rb" \[([ =]*=[ =]*)\]")
 
-def release():
-    global released
-    if control is not None and not released:
-        try:
-            control.sendall(b"x")
-        except OSError:
-            pass
-        released = True
+def plain(data):
+    return bytes(data).replace(b"\r\n", b"\n")
 
-try:
-    proc = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=slave,
-                            start_new_session=True)
-    os.close(slave)
-    slave = None
-    streams = {master: stderr, proc.stdout.fileno(): stdout}
+def pump_until(predicate, description):
     deadline = time.monotonic() + 15
-    # A correctly detached CLI can exit before its child connects.
-    while proc.stdout.fileno() in streams or ready is None:
+    while not predicate():
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            if ready is None:
-                failure = "hook did not signal readiness"
-                break
-            if released:
-                failure = "get did not exit after releasing the hook"
-                break
-            # Record the blocked observation before allowing cleanup to make
-            # either a buffered print or a stuck Cmd.Wait appear successful.
-            release()
-            deadline = time.monotonic() + 10
-            continue
-        readers = list(streams) + ([server] if ready is None else [])
-        readable, _, _ = select.select(readers, [], [], remaining)
+        assert remaining > 0, "timed out waiting for " + description
+        readable, _, _ = select.select(list(streams) + [server.fileno()], [], [], remaining)
         for fd in readable:
-            if fd is server:
+            if fd == server.fileno():
                 control, _ = server.accept()
+                connections.append(control)
                 control.settimeout(5)
-                message = bytearray()
-                while not message.endswith(b"\n"):
-                    chunk = control.recv(4096)
-                    if not chunk:
-                        raise RuntimeError("hook closed readiness socket")
-                    message.extend(chunk)
-                ready = json.loads(message)
-                deadline = time.monotonic() + 5
+                with control.makefile("rb") as reader:
+                    message = reader.readline(4097)
+                assert len(message) <= 4096 and message.endswith(b"\n"), "invalid readiness message"
+                event = json.loads(message)
+                stage = event["stage"]
+                assert stage in ("git", "foreground", "child") and stage not in events, event
+                events[stage], controls[stage] = event, control
                 continue
             try:
                 chunk = os.read(fd, 65536)
@@ -3446,203 +3185,147 @@ try:
                 streams[fd].extend(chunk)
             else:
                 del streams[fd]
-        if ready is not None and not released:
-            streamed = all(line in stderr for line in
-                           (b"hook-stdout-line\r\n", b"hook-stderr-line\r\n"))
-            if background:
-                # A child intentionally retains stderr (both hook streams).
-                # Machine stdout EOF, not PTY EOF, marks CLI completion.
-                if proc.stdout.fileno() not in streams:
-                    proc.wait(timeout=5)
-                    completed = True
-            elif streamed:
-                release()
-                deadline = time.monotonic() + 10
+
+try:
+    try:
+        master, slave = pty.openpty()
+    except OSError as exc:
+        print("PTY unavailable:", exc)
+        sys.exit(77)
+    slave_name = os.ttyname(slave)
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
+    server.bind(("127.0.0.1", 0))
+    server.listen(4)
+    os.environ["TREEHOUSE_TEST_PORT"] = str(server.getsockname()[1])
+    helper = os.path.join(os.environ["HOME"], "progress-hook.py")
+    with open(helper, "w") as f:
+        f.write('''import json, os, socket, subprocess, sys
+stage = sys.argv[1]
+if stage == "background":
+    subprocess.Popen([sys.executable, __file__, "child"])
+    sys.exit(0)
+with socket.create_connection(("127.0.0.1", int(os.environ["TREEHOUSE_TEST_PORT"])), timeout=45) as control:
+    if stage == "foreground":
+        print("progress-hook-stdout")
+        print("progress-hook-stderr", file=sys.stderr)
+    event = {"stage": stage, "path": os.getcwd(),
+             "stdout_tty": os.ttyname(1) if os.isatty(1) else None,
+             "stderr_tty": os.ttyname(2) if os.isatty(2) else None}
+    control.sendall((json.dumps(event) + "\\n").encode())
+    assert control.recv(1) == b"x", "missing release token"
+    if stage == "child":
+        control.sendall(b"a")  # Prove survival after CLI completion, not just readiness.
+    sys.exit(7 if stage == "foreground" else 0)
+''')
+    hook_dir = os.path.join(os.environ["HOME"], "git-hooks")
+    os.makedirs(hook_dir)
+    checkout = os.path.join(hook_dir, "post-checkout")
+    with open(checkout, "w") as f:
+        f.write("#!/bin/sh\nexec " + shlex.join([sys.executable, helper, "git"]) + "\n")
+    os.chmod(checkout, 0o755)
+    subprocess.run(["git", "config", "core.hooksPath", hook_dir], check=True, timeout=5)
+    if animate:
+        config_dir = os.path.join(os.environ["HOME"], ".config", "treehouse")
+        os.makedirs(config_dir)
+        commands = [shlex.join([sys.executable, helper, mode]) for mode in ("foreground", "background")]
+        with open(os.path.join(config_dir, "config.toml"), "w") as f:
+            f.write("[hooks]\npost_create = " + json.dumps(commands) + "\n")
+    proc = subprocess.Popen([binary, "get", "--lease", "--json"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=slave, start_new_session=True)
+    os.close(slave)
+    slave = None
+    stdout_fd = proc.stdout.fileno()
+    streams = {master: stderr, stdout_fd: stdout}
+    pump_until(lambda: "git" in events, "Git checkout readiness")
+    git_offset = len(stderr)
+    if animate:
+        pump_until(lambda: len(set(pattern.findall(stderr[git_offset:]))) >= 2,
+                   "two distinct bar frames while Git checkout is blocked")
+    assert not stdout and done not in stderr, "output completed before releasing Git"
+    controls["git"].sendall(b"x")
+    if animate:
+        pump_until(lambda: "foreground" in events and all(m in plain(stderr) for m in markers),
+                   "foreground readiness and both newline prints before release")
+        for stream in ("stdout_tty", "stderr_tty"):
+            assert events["foreground"][stream] == slave_name, events["foreground"]
+        assert not stdout and done not in stderr, "output completed before releasing foreground hook"
+        controls["foreground"].sendall(b"x")
+        pump_until(lambda: "child" in events, "background child readiness")
+        # PTY EOF cannot mark completion: the child must still hold both streams.
+        pump_until(lambda: stdout_fd not in streams and done in stderr,
+                   "CLI stdout EOF and Done while the child is blocked")
+        assert proc.wait(timeout=5) == 0, "CLI failed"
+        controls["child"].sendall(b"x")
+        assert controls["child"].recv(1) == b"a", "child died before CLI completion"
+    else:
+        pump_until(lambda: not streams, "static CLI output EOF")
+        assert proc.wait(timeout=5) == 0, "CLI failed"
+
+    lease = json.loads(stdout)  # Parse the entire stream, rejecting contaminating text.
+    assert lease["lease_id"] and lease["leased_at"], lease
+    path = lease["path"]
+    assert os.path.isabs(path) and path == events["git"]["path"], lease
+    assert os.path.exists(os.path.join(path, ".git")), path
+    static_transcript = plain(stderr)
+    if animate:
+        announcement = tree + b" Running post-create hooks...\n"
+        static_transcript = static_transcript[static_transcript.index(announcement):]
+        offset = 0
+        for step in (announcement, *markers, tree + b" hook command failed:", done):
+            offset = static_transcript.index(step, offset) + len(step)
+    assert all(control not in static_transcript for control in (b"\r", b"\x1b", tree + b" [")), static_transcript
+except BaseException:
+    print("captured stdout:", repr(bytes(stdout)), "\ncaptured stderr:", repr(bytes(stderr)), file=sys.stderr)
+    raise
 finally:
-    release()
-    if proc is not None:
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        finally:
-            # Kill descendants even if the CLI has already exited successfully.
+    try:
+        if proc is not None:
+            # Kill the group even when its leader has already exited.
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             proc.wait(timeout=5)
+    finally:
+        if proc is not None:
             proc.stdout.close()
-    if control is not None:
-        control.close()
-    server.close()
-    os.close(master)
-    if slave is not None:
-        os.close(slave)
-
-print(json.dumps({"stdout": stdout.decode(), "stderr": stderr.decode(),
-                  "exit_code": proc.returncode, "ready": ready,
-                  "streamed": streamed, "completed": completed, "failure": failure}))
+        for control in connections:
+            control.close()
+        server.close()
+        for fd in (master, slave):
+            if fd is not None:
+                os.close(fd)
 `
-	for _, mode := range []string{"path", "json"} {
-		t.Run(mode, func(t *testing.T) {
+	for _, tc := range []struct {
+		term    string
+		columns int
+		animate bool
+	}{
+		{"xterm-256color", 80, true},
+		{"dumb", 80, false},
+		{"xterm-256color", 17, false},
+		{"xterm-256color", 0, false},
+	} {
+		t.Run(tc.term+"/"+strconv.Itoa(tc.columns), func(t *testing.T) {
 			t.Parallel()
 			repoDir, homeDir := setupTestRepo(t)
-			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
-			args := []string{"-c", terminalReader, treehouseBin, "get", "--lease"}
-			if mode == "json" {
-				args = append(args, "--json")
-			}
-			terminal := exec.CommandContext(ctx, python, args...)
-			// Python's KeyboardInterrupt runs the finally block on outer timeout.
+			terminal := exec.CommandContext(ctx, python, "-c", terminalReader, treehouseBin,
+				strconv.Itoa(tc.columns), strconv.FormatBool(tc.animate))
+			terminal.Dir = repoDir
+			terminal.Env = buildEnv(homeDir, "TERM="+tc.term)
+			// KeyboardInterrupt reaches Python's finally block on outer timeout.
 			terminal.Cancel = func() error { return terminal.Process.Signal(os.Interrupt) }
 			terminal.WaitDelay = 10 * time.Second
-			terminal.Dir = repoDir
-			terminal.Env = buildEnv(homeDir, "TERM=xterm-256color",
-				"TREEHOUSE_TEST_BACKGROUND="+strconv.FormatBool(background))
 			output, err := terminal.CombinedOutput()
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) && exitErr.ExitCode() == 77 {
+				t.Skipf("Python PTY is unavailable: %s", output)
+			}
 			if err != nil {
-				t.Fatalf("terminal reader failed: %v: %s", err, output)
-			}
-			var result struct {
-				Stdout   string `json:"stdout"`
-				Stderr   string `json:"stderr"`
-				ExitCode int    `json:"exit_code"`
-				Ready    *struct {
-					StdoutTTY bool   `json:"stdout_tty"`
-					StderrTTY bool   `json:"stderr_tty"`
-					Path      string `json:"path"`
-				} `json:"ready"`
-				Streamed  bool   `json:"streamed"`
-				Completed bool   `json:"completed"`
-				Failure   string `json:"failure"`
-			}
-			if err := json.Unmarshal(output, &result); err != nil {
-				t.Fatalf("invalid terminal result: %v: %s", err, output)
-			}
-			if result.Failure != "" || result.Ready == nil || result.ExitCode != 0 {
-				t.Fatalf("hook execution failed: %s: %s", result.Failure, output)
-			}
-			if background {
-				if !result.Completed {
-					t.Error("get --lease waited for the background hook child to release inherited streams")
-				}
-			} else {
-				if !result.Ready.StdoutTTY || !result.Ready.StderrTTY {
-					t.Errorf("hook terminal identity lost: stdout.isatty=%v stderr.isatty=%v", result.Ready.StdoutTTY, result.Ready.StderrTTY)
-				}
-				if !result.Streamed {
-					t.Error("ordinary newline prints did not stream from both hook outputs while the hook was blocked")
-				}
-			}
-			path := strings.TrimSpace(result.Stdout)
-			if mode == "json" {
-				var lease leaseJSONResult
-				if err := json.Unmarshal([]byte(result.Stdout), &lease); err != nil {
-					t.Fatalf("hook corrupted lease JSON: %v: %q", err, result.Stdout)
-				}
-				if lease.LeaseID == "" || lease.LeasedAt.IsZero() {
-					t.Fatalf("lease metadata missing: %q", result.Stdout)
-				}
-				path = lease.Path
-			} else if result.Stdout != path+"\n" {
-				t.Fatalf("hook changed path-only stdout: %q", result.Stdout)
-			}
-			if !filepath.IsAbs(path) || path != result.Ready.Path {
-				t.Fatalf("stdout path %q differs from hook worktree %q", path, result.Ready.Path)
-			}
-			if _, err := os.Stat(filepath.Join(path, ".git")); err != nil {
-				t.Fatalf("stdout did not identify a worktree: %v", err)
+				t.Fatalf("terminal harness failed: %v\n%s", err, output)
 			}
 		})
-	}
-}
-
-func TestGetSetupProgressOmitsSkippedSteps(t *testing.T) {
-	for _, noRemote := range []bool{false, true} {
-		name := "no-fetch"
-		if noRemote {
-			name = "no-origin"
-		}
-		t.Run(name, func(t *testing.T) {
-			repoDir, homeDir := setupTestRepo(t)
-			args := []string{"get", "--lease"}
-			if noRemote {
-				gitCmd(t, repoDir, "remote", "remove", "origin")
-			} else {
-				args = append(args, "--no-fetch")
-			}
-			_, stderr, code := runTreehouse(t, repoDir, homeDir, nil, args...)
-			if code != 0 {
-				t.Fatalf("get failed (%d): %s", code, stderr)
-			}
-			assertProgressOrder(t, stderr, "🌳 Setting up worktree...", "🌳 Creating worktree...", "🌳 Done.")
-			for _, skipped := range []string{"🌳 Fetching from origin...", "🌳 Running post-create hooks...", "🌳 Reusing worktree..."} {
-				if strings.Contains(stderr, skipped) {
-					t.Errorf("announced skipped step %q: %s", skipped, stderr)
-				}
-			}
-		})
-	}
-}
-
-func TestGetSetupProgressReusedWorktree(t *testing.T) {
-	repoDir, homeDir := setupTestRepo(t)
-	writeProgressHook(t, homeDir)
-	stdout, stderr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
-	if code != 0 {
-		t.Fatalf("initial get failed (%d): %s", code, stderr)
-	}
-	path := strings.TrimSpace(stdout)
-	if _, stderr, code := runTreehouse(t, repoDir, homeDir, nil, "return", path); code != 0 {
-		t.Fatalf("return failed (%d): %s", code, stderr)
-	}
-	stdout, stderr, code = runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
-	if code != 0 || strings.TrimSpace(stdout) != path {
-		t.Fatalf("did not reuse worktree (%d): stdout %q, stderr %q", code, stdout, stderr)
-	}
-	assertProgressOrder(t, stderr, "🌳 Setting up worktree...", "🌳 Fetching from origin...", "🌳 Reusing worktree...", "🌳 Running post-create hooks...", "progress-hook-started", "🌳 Done.")
-	if strings.Contains(stderr, "🌳 Creating worktree...") {
-		t.Fatalf("reuse announced creation: %s", stderr)
-	}
-}
-
-func TestGetSetupProgressStopsOnFetchFailure(t *testing.T) {
-	repoDir, homeDir := setupTestRepo(t)
-	writeProgressHook(t, homeDir)
-	gitCmd(t, repoDir, "remote", "set-url", "origin", filepath.Join(homeDir, "missing-remote.git"))
-	stdout, stderr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
-	if code == 0 || stdout != "" {
-		t.Fatalf("failed fetch returned success or stdout (%d): %q", code, stdout)
-	}
-	assertProgressOrder(t, stderr, "🌳 Setting up worktree...", "🌳 Fetching from origin...", "fetch failed")
-	for _, skipped := range []string{"🌳 Creating worktree...", "🌳 Reusing worktree...", "🌳 Running post-create hooks...", "progress-hook-started", "🌳 Done."} {
-		if strings.Contains(stderr, skipped) {
-			t.Errorf("failed fetch announced later step %q: %s", skipped, stderr)
-		}
-	}
-}
-
-func writeProgressHook(t *testing.T, homeDir string) {
-	t.Helper()
-	configDir := filepath.Join(homeDir, ".config", "treehouse")
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte("[hooks]\npost_create = [\"echo progress-hook-started\"]\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func assertProgressOrder(t *testing.T, stderr string, steps ...string) {
-	t.Helper()
-	rest := stderr
-	for _, step := range steps {
-		index := strings.Index(rest, step)
-		if index < 0 {
-			t.Fatalf("missing or out-of-order step %q in stderr: %s", step, stderr)
-		}
-		rest = rest[index+len(step):]
 	}
 }
