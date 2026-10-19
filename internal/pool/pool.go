@@ -394,9 +394,11 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 	}
 
 	fmt.Fprintf(os.Stderr, "🌳 Setting up worktree...\n")
+	progress := newSetupProgress()
 	if !opts.skipFetch && vcs.HasRemote(repoRoot, "origin") {
-		fmt.Fprintln(os.Stderr, "🌳 Fetching from origin...")
-		if err := vcs.Fetch(repoRoot); err != nil {
+		if err := progress.run("Fetching from origin...", func() error {
+			return vcs.Fetch(repoRoot)
+		}); err != nil {
 			return LeaseInfo{}, fmt.Errorf("fetch failed: %w", err)
 		}
 	}
@@ -528,8 +530,9 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 			if !wt.SeedInventoryKnown {
 				seededPaths = nil
 			}
-			fmt.Fprintln(os.Stderr, "🌳 Reusing worktree...")
-			if err := vcs.ResetWorktreeToRefWithSeededPaths(wt.Path, resetRef, head, true, seededPaths); err != nil {
+			if err := progress.run("Reusing worktree...", func() error {
+				return vcs.ResetWorktreeToRefWithSeededPaths(wt.Path, resetRef, head, true, seededPaths)
+			}); err != nil {
 				continue
 			}
 			state.Worktrees[i].BaseBranch = opts.baseBranch
@@ -680,8 +683,9 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 			}
 		}
 
-		fmt.Fprintln(os.Stderr, "🌳 Creating worktree...")
-		if err := vcs.AddWorktree(repoRoot, wtPath, branch); err != nil {
+		if err := progress.run("Creating worktree...", func() error {
+			return vcs.AddWorktree(repoRoot, wtPath, branch)
+		}); err != nil {
 			return fmt.Errorf("failed to create worktree: %w", err)
 		}
 		seededPaths, err := seedWorktree(repoRoot, wtPath, opts.includeManifest)
@@ -812,8 +816,9 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 		return LeaseInfo{}, err
 	}
 	if runPostCreate && len(postCreate) > 0 {
-		fmt.Fprintln(os.Stderr, "🌳 Running post-create hooks...")
-		hooks.Run(postCreate, acquired.Path, opts.hookStdout, opts.hookStderr)
+		progress.start("Running post-create hooks...")
+		hooks.Run(postCreate, acquired.Path, progress.output(opts.hookStdout), progress.output(opts.hookStderr))
+		progress.finish()
 	}
 	fmt.Fprintln(os.Stderr, "🌳 Done.")
 

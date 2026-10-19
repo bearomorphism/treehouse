@@ -191,7 +191,9 @@ creating or reusing a worktree, and running configured post-create hooks, follow
 by `🌳 Done.` when setup finishes. Steps that are skipped are not announced (for
 example, fetching with `--no-fetch` or without an origin remote). These messages
 also appear with `get --lease` and `get --lease --json`; stdout remains the path
-or JSON result. Hook failures remain warnings and do not fail acquisition.
+or JSON result. Terminal stderr also shows an animated indeterminate bar while
+these operations run, with no percentage or ETA; redirected stderr retains plain
+step messages. Hook failures remain warnings and do not fail acquisition.
 
 ### Flags
 
