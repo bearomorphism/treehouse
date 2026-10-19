@@ -3077,8 +3077,8 @@ func TestGetSetupProgress(t *testing.T) {
 	}
 }
 
-// TestGetSetupProgressAnimatesInTerminal observes progress while a real hook is
-// blocked, and checks that incapable terminals receive only static progress.
+// TestGetSetupProgressAnimatesInTerminal observes progress while Git's checkout
+// is blocked, and checks that incapable terminals receive only static progress.
 func TestGetSetupProgressAnimatesInTerminal(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Python PTY test requires Unix")
@@ -3216,13 +3216,18 @@ print(json.dumps({"stdout": stdout.decode("utf-8", "replace"),
 				if err := os.MkdirAll(configDir, 0o755); err != nil {
 					t.Fatal(err)
 				}
-				// JSON string quoting is also valid TOML basic-string quoting. The
-				// inner shell quoting preserves spaces and apostrophes in the path.
-				hook, err := json.Marshal("'" + strings.ReplaceAll(waitShellBin, "'", "'\"'\"'") + "'; echo progress-hook-started; exit 7")
-				if err != nil {
+				// Block AddWorktree itself, not Treehouse's lifecycle hooks: those
+				// must inherit real terminal streams with no progress redraws.
+				hookDir := filepath.Join(homeDir, "git-hooks")
+				if err := os.MkdirAll(hookDir, 0o755); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte("[hooks]\npost_create = ["+string(hook)+"]\n"), 0o644); err != nil {
+				gitHook := "#!/bin/sh\nexec '" + strings.ReplaceAll(waitShellBin, "'", "'\"'\"'") + "'\n"
+				if err := os.WriteFile(filepath.Join(hookDir, "post-checkout"), []byte(gitHook), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				gitCmd(t, repoDir, "config", "core.hooksPath", hookDir)
+				if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte("[hooks]\npost_create = [\"echo progress-hook-started; exit 7\"]\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -3273,8 +3278,10 @@ print(json.dumps({"stdout": stdout.decode("utf-8", "replace"),
 					t.Fatalf("get failed (%d): %s", result.ExitCode, result.Stderr)
 				}
 				assertProgressOrder(t, result.Stderr, "🌳 Setting up worktree...", "🌳 Fetching from origin...", "🌳 Creating worktree...", "🌳 Running post-create hooks...", "progress-hook-started\r\n", "🌳 hook command failed:", "🌳 Done.")
-				if strings.Contains(strings.SplitN(result.Stderr, "🌳 Done.", 2)[1], "\r🌳 [") {
-					t.Fatalf("animation continued after Done: %q", result.Stderr)
+				afterHooks := strings.SplitN(result.Stderr, "Running post-create hooks...", 2)[1]
+				afterHooks = strings.ReplaceAll(afterHooks, "\r\n", "\n")
+				if strings.Contains(afterHooks, "🌳 [") || strings.ContainsAny(afterHooks, "\r\x1b") {
+					t.Errorf("animation continued during or after lifecycle hooks: %q", afterHooks)
 				}
 				path := strings.TrimSpace(result.Stdout)
 				if mode == "json" {
@@ -3301,6 +3308,254 @@ print(json.dumps({"stdout": stdout.decode("utf-8", "replace"),
 				}
 			})
 		}
+	}
+}
+
+func TestGetHookPreservesTerminalAndLineBuffering(t *testing.T) {
+	testGetHookTerminal(t, false)
+}
+
+func TestGetHookBackgroundChildDoesNotDelayLease(t *testing.T) {
+	testGetHookTerminal(t, true)
+}
+
+// The socket is independent of hook output: readiness must remain observable
+// even when a wrapped stdout is buffered, or a descendant holds its pipe open.
+func testGetHookTerminal(t *testing.T, background bool) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("Python PTY test requires Unix")
+	}
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is unavailable")
+	}
+	probe := exec.Command(python, "-c", "import os, pty; m, s = pty.openpty(); os.close(m); os.close(s)")
+	if output, err := probe.CombinedOutput(); err != nil {
+		t.Skipf("Python PTY is unavailable: %v: %s", err, output)
+	}
+
+	const terminalReader = `
+import errno
+import fcntl
+import json
+import os
+import pty
+import select
+import shlex
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import termios
+import time
+
+background = os.environ["TREEHOUSE_TEST_BACKGROUND"] == "true"
+# Do not mask the regression with Python's unbuffered mode, even if inherited.
+os.environ.pop("PYTHONUNBUFFERED", None)
+server = socket.socket()
+server.bind(("127.0.0.1", 0))
+server.listen(1)
+os.environ["TREEHOUSE_TEST_PORT"] = str(server.getsockname()[1])
+hook = os.path.join(os.environ["HOME"], "terminal-hook.py")
+with open(hook, "w") as f:
+    f.write('''import json, os, socket, subprocess, sys
+if os.environ["TREEHOUSE_TEST_BACKGROUND"] == "true" and len(sys.argv) == 1:
+    subprocess.Popen([sys.executable, __file__, "child"])
+    sys.exit(0)
+with socket.create_connection(("127.0.0.1", int(os.environ["TREEHOUSE_TEST_PORT"])), timeout=20) as control:
+    print("hook-stdout-line")
+    print("hook-stderr-line", file=sys.stderr)
+    control.sendall((json.dumps({"stdout_tty": sys.stdout.isatty(),
+                                "stderr_tty": sys.stderr.isatty(),
+                                "path": os.getcwd()}) + "\\n").encode())
+    if control.recv(1) != b"x":
+        sys.exit(9)
+''')
+config_dir = os.path.join(os.environ["HOME"], ".config", "treehouse")
+os.makedirs(config_dir, exist_ok=True)
+with open(os.path.join(config_dir, "config.toml"), "w") as f:
+    f.write("[hooks]\npost_create = [" + json.dumps(shlex.join([sys.executable, hook])) + "]\n")
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+proc = None
+control = None
+ready = None
+stderr = bytearray()
+stdout = bytearray()
+streamed = False
+completed = False
+released = False
+failure = ""
+
+def release():
+    global released
+    if control is not None and not released:
+        try:
+            control.sendall(b"x")
+        except OSError:
+            pass
+        released = True
+
+try:
+    proc = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=slave,
+                            start_new_session=True)
+    os.close(slave)
+    slave = None
+    streams = {master: stderr, proc.stdout.fileno(): stdout}
+    deadline = time.monotonic() + 15
+    # A correctly detached CLI can exit before its child connects.
+    while proc.stdout.fileno() in streams or ready is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if ready is None:
+                failure = "hook did not signal readiness"
+                break
+            if released:
+                failure = "get did not exit after releasing the hook"
+                break
+            # Record the blocked observation before allowing cleanup to make
+            # either a buffered print or a stuck Cmd.Wait appear successful.
+            release()
+            deadline = time.monotonic() + 10
+            continue
+        readers = list(streams) + ([server] if ready is None else [])
+        readable, _, _ = select.select(readers, [], [], remaining)
+        for fd in readable:
+            if fd is server:
+                control, _ = server.accept()
+                control.settimeout(5)
+                message = bytearray()
+                while not message.endswith(b"\n"):
+                    chunk = control.recv(4096)
+                    if not chunk:
+                        raise RuntimeError("hook closed readiness socket")
+                    message.extend(chunk)
+                ready = json.loads(message)
+                deadline = time.monotonic() + 5
+                continue
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError as exc:
+                if fd != master or exc.errno != errno.EIO:
+                    raise
+                chunk = b""
+            if chunk:
+                streams[fd].extend(chunk)
+            else:
+                del streams[fd]
+        if ready is not None and not released:
+            streamed = all(line in stderr for line in
+                           (b"hook-stdout-line\r\n", b"hook-stderr-line\r\n"))
+            if background:
+                # A child intentionally retains stderr (both hook streams).
+                # Machine stdout EOF, not PTY EOF, marks CLI completion.
+                if proc.stdout.fileno() not in streams:
+                    proc.wait(timeout=5)
+                    completed = True
+            elif streamed:
+                release()
+                deadline = time.monotonic() + 10
+finally:
+    release()
+    if proc is not None:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            # Kill descendants even if the CLI has already exited successfully.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=5)
+            proc.stdout.close()
+    if control is not None:
+        control.close()
+    server.close()
+    os.close(master)
+    if slave is not None:
+        os.close(slave)
+
+print(json.dumps({"stdout": stdout.decode(), "stderr": stderr.decode(),
+                  "exit_code": proc.returncode, "ready": ready,
+                  "streamed": streamed, "completed": completed, "failure": failure}))
+`
+	for _, mode := range []string{"path", "json"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			repoDir, homeDir := setupTestRepo(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+			args := []string{"-c", terminalReader, treehouseBin, "get", "--lease"}
+			if mode == "json" {
+				args = append(args, "--json")
+			}
+			terminal := exec.CommandContext(ctx, python, args...)
+			// Python's KeyboardInterrupt runs the finally block on outer timeout.
+			terminal.Cancel = func() error { return terminal.Process.Signal(os.Interrupt) }
+			terminal.WaitDelay = 10 * time.Second
+			terminal.Dir = repoDir
+			terminal.Env = buildEnv(homeDir, "TERM=xterm-256color",
+				"TREEHOUSE_TEST_BACKGROUND="+strconv.FormatBool(background))
+			output, err := terminal.CombinedOutput()
+			if err != nil {
+				t.Fatalf("terminal reader failed: %v: %s", err, output)
+			}
+			var result struct {
+				Stdout   string `json:"stdout"`
+				Stderr   string `json:"stderr"`
+				ExitCode int    `json:"exit_code"`
+				Ready    *struct {
+					StdoutTTY bool   `json:"stdout_tty"`
+					StderrTTY bool   `json:"stderr_tty"`
+					Path      string `json:"path"`
+				} `json:"ready"`
+				Streamed  bool   `json:"streamed"`
+				Completed bool   `json:"completed"`
+				Failure   string `json:"failure"`
+			}
+			if err := json.Unmarshal(output, &result); err != nil {
+				t.Fatalf("invalid terminal result: %v: %s", err, output)
+			}
+			if result.Failure != "" || result.Ready == nil || result.ExitCode != 0 {
+				t.Fatalf("hook execution failed: %s: %s", result.Failure, output)
+			}
+			if background {
+				if !result.Completed {
+					t.Error("get --lease waited for the background hook child to release inherited streams")
+				}
+			} else {
+				if !result.Ready.StdoutTTY || !result.Ready.StderrTTY {
+					t.Errorf("hook terminal identity lost: stdout.isatty=%v stderr.isatty=%v", result.Ready.StdoutTTY, result.Ready.StderrTTY)
+				}
+				if !result.Streamed {
+					t.Error("ordinary newline prints did not stream from both hook outputs while the hook was blocked")
+				}
+			}
+			path := strings.TrimSpace(result.Stdout)
+			if mode == "json" {
+				var lease leaseJSONResult
+				if err := json.Unmarshal([]byte(result.Stdout), &lease); err != nil {
+					t.Fatalf("hook corrupted lease JSON: %v: %q", err, result.Stdout)
+				}
+				if lease.LeaseID == "" || lease.LeasedAt.IsZero() {
+					t.Fatalf("lease metadata missing: %q", result.Stdout)
+				}
+				path = lease.Path
+			} else if result.Stdout != path+"\n" {
+				t.Fatalf("hook changed path-only stdout: %q", result.Stdout)
+			}
+			if !filepath.IsAbs(path) || path != result.Ready.Path {
+				t.Fatalf("stdout path %q differs from hook worktree %q", path, result.Ready.Path)
+			}
+			if _, err := os.Stat(filepath.Join(path, ".git")); err != nil {
+				t.Fatalf("stdout did not identify a worktree: %v", err)
+			}
+		})
 	}
 }
 

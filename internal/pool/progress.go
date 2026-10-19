@@ -18,15 +18,14 @@ const setupProgressCells = 17
 // only on terminals. Each operation stops its animation before returning or
 // emitting diagnostics. No cursor hiding or terminal mode changes are needed.
 type setupProgress struct {
-	out       io.Writer
-	terminal  bool
-	width     func() int
-	stop      chan struct{}
-	done      chan struct{}
-	mu        sync.Mutex
-	visible   bool
-	openLines int
-	frame     int
+	out      io.Writer
+	terminal bool
+	width    func() int
+	stop     chan struct{}
+	done     chan struct{}
+	mu       sync.Mutex
+	visible  bool
+	frame    int
 }
 
 func newSetupProgress() *setupProgress {
@@ -51,7 +50,6 @@ func (p *setupProgress) start(label string) {
 	if !p.terminal || p.width() <= setupProgressCells {
 		return
 	}
-	p.openLines = 0
 	p.stop, p.done = make(chan struct{}), make(chan struct{})
 	p.frame = 0
 	p.draw()
@@ -83,9 +81,6 @@ func (p *setupProgress) finish() {
 }
 
 func (p *setupProgress) draw() {
-	if p.openLines != 0 {
-		return
-	}
 	// Recheck for resizes while an operation is running.
 	if p.width() <= setupProgressCells {
 		p.clear()
@@ -109,38 +104,4 @@ func (p *setupProgress) clear() {
 		}
 		p.visible = false
 	}
-}
-
-// output clears the bar before streaming hook output, preserving its destination
-// and bytes. Each stream's partial line suspends redraws independently, since
-// stdout and stderr may go to different destinations.
-func (p *setupProgress) output(dst io.Writer) io.Writer {
-	if !p.terminal {
-		return dst
-	}
-	return &setupProgressWriter{progress: p, dst: dst}
-}
-
-type setupProgressWriter struct {
-	progress *setupProgress
-	dst      io.Writer
-	lineOpen bool
-}
-
-func (w *setupProgressWriter) Write(b []byte) (int, error) {
-	p := w.progress
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.clear()
-	n, err := w.dst.Write(b)
-	if n > 0 {
-		if w.lineOpen {
-			p.openLines--
-		}
-		w.lineOpen = b[n-1] != '\n'
-		if w.lineOpen {
-			p.openLines++
-		}
-	}
-	return n, err
 }

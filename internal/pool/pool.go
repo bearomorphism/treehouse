@@ -816,9 +816,9 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 		return LeaseInfo{}, err
 	}
 	if runPostCreate && len(postCreate) > 0 {
-		progress.start("Running post-create hooks...")
-		hooks.Run(postCreate, acquired.Path, progress.output(opts.hookStdout), progress.output(opts.hookStderr))
-		progress.finish()
+		fmt.Fprintln(os.Stderr, "🌳 Running post-create hooks...")
+		// Preserve the original file descriptors: hooks own the terminal here.
+		hooks.Run(postCreate, acquired.Path, opts.hookStdout, opts.hookStderr)
 	}
 	fmt.Fprintln(os.Stderr, "🌳 Done.")
 
