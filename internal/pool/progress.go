@@ -11,22 +11,31 @@ import (
 	"github.com/mattn/go-isatty"
 )
 
+// The tree occupies two terminal cells; the complete bar occupies 17.
+const setupProgressCells = 17
+
 // setupProgress keeps the step transcript on stderr, with an indeterminate bar
 // only on terminals. Each operation stops its animation before returning or
 // emitting diagnostics. No cursor hiding or terminal mode changes are needed.
 type setupProgress struct {
-	out      io.Writer
-	terminal bool
-	stop     chan struct{}
-	done     chan struct{}
-	mu       sync.Mutex
-	visible  bool
-	lineOpen bool
-	frame    int
+	out       io.Writer
+	terminal  bool
+	width     func() int
+	stop      chan struct{}
+	done      chan struct{}
+	mu        sync.Mutex
+	visible   bool
+	openLines int
+	frame     int
 }
 
 func newSetupProgress() *setupProgress {
-	return &setupProgress{out: os.Stderr, terminal: isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd())}
+	stderr := os.Stderr
+	return &setupProgress{
+		out:      stderr,
+		terminal: os.Getenv("TERM") != "dumb" && isatty.IsTerminal(stderr.Fd()),
+		width:    func() int { return progressTerminalWidth(stderr) },
+	}
 }
 
 func (p *setupProgress) run(label string, operation func() error) error {
@@ -37,9 +46,12 @@ func (p *setupProgress) run(label string, operation func() error) error {
 
 func (p *setupProgress) start(label string) {
 	fmt.Fprintln(p.out, "🌳 "+label)
-	if !p.terminal {
+	// Leave a spare column so neither drawing nor clearing triggers wrapping.
+	// Unknown dimensions and narrow terminals retain the static transcript.
+	if !p.terminal || p.width() <= setupProgressCells {
 		return
 	}
+	p.openLines = 0
 	p.stop, p.done = make(chan struct{}), make(chan struct{})
 	p.frame = 0
 	p.draw()
@@ -71,7 +83,12 @@ func (p *setupProgress) finish() {
 }
 
 func (p *setupProgress) draw() {
-	if p.lineOpen {
+	if p.openLines != 0 {
+		return
+	}
+	// Recheck for resizes while an operation is running.
+	if p.width() <= setupProgressCells {
+		p.clear()
 		return
 	}
 	// Bounce a fixed-width segment, without implying a percentage or ETA.
@@ -86,34 +103,44 @@ func (p *setupProgress) draw() {
 
 func (p *setupProgress) clear() {
 	if p.visible {
-		// The tree occupies two terminal cells; the complete bar occupies 17.
-		fmt.Fprint(p.out, "\r                 \r")
+		// A resize must not make the clearing spaces wrap onto another row.
+		if cells := min(setupProgressCells, p.width()-1); cells > 0 {
+			fmt.Fprintf(p.out, "\r%s\r", strings.Repeat(" ", cells))
+		}
 		p.visible = false
 	}
 }
 
 // output clears the bar before streaming hook output, preserving its destination
-// and bytes. Partial lines suspend redraws until the hook finishes the line.
+// and bytes. Each stream's partial line suspends redraws independently, since
+// stdout and stderr may go to different destinations.
 func (p *setupProgress) output(dst io.Writer) io.Writer {
 	if !p.terminal {
 		return dst
 	}
-	return setupProgressWriter{progress: p, dst: dst}
+	return &setupProgressWriter{progress: p, dst: dst}
 }
 
 type setupProgressWriter struct {
 	progress *setupProgress
 	dst      io.Writer
+	lineOpen bool
 }
 
-func (w setupProgressWriter) Write(b []byte) (int, error) {
+func (w *setupProgressWriter) Write(b []byte) (int, error) {
 	p := w.progress
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.clear()
 	n, err := w.dst.Write(b)
 	if n > 0 {
-		p.lineOpen = b[n-1] != '\n'
+		if w.lineOpen {
+			p.openLines--
+		}
+		w.lineOpen = b[n-1] != '\n'
+		if w.lineOpen {
+			p.openLines++
+		}
 	}
 	return n, err
 }

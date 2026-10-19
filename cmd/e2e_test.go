@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -3077,7 +3078,7 @@ func TestGetSetupProgress(t *testing.T) {
 }
 
 // TestGetSetupProgressAnimatesInTerminal observes progress while a real hook is
-// blocked, rather than accepting frames printed only before or after the work.
+// blocked, and checks that incapable terminals receive only static progress.
 func TestGetSetupProgressAnimatesInTerminal(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Python PTY test requires Unix")
@@ -3093,19 +3094,25 @@ func TestGetSetupProgressAnimatesInTerminal(t *testing.T) {
 
 	const terminalReader = `
 import errno
+import fcntl
 import json
 import os
 import pty
 import re
 import select
 import signal
+import struct
 import subprocess
 import sys
+import termios
 import time
 
+animate = os.environ["TREEHOUSE_TEST_ANIMATE"] == "true"
+columns = int(os.environ["TREEHOUSE_TEST_COLUMNS"])
 ready = os.environ["TREEHOUSE_TEST_READY"]
 release = os.environ["TREEHOUSE_TEST_RELEASE"]
 master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
 proc = None
 stderr = bytearray()
 stdout = bytearray()
@@ -3138,7 +3145,7 @@ try:
                           if b"=" in m.group(1))
             if "🌳 Done.".encode() in blocked:
                 failure = "Done was printed before the hook was released"
-            if len(frames) >= 2 or failure:
+            if not animate or len(frames) >= 2 or failure:
                 unblock()
                 released = True
                 deadline = time.monotonic() + 10
@@ -3165,7 +3172,7 @@ try:
             else:
                 del streams[fd]
     if not released:
-        failure = failure or "treehouse exited before animation was observed in its blocked hook"
+        failure = failure or "treehouse exited before its blocked hook was released"
 finally:
     # Always let the helper finish, including assertion/reader failures. Give
     # the command time to reap its hook before killing a stuck process group.
@@ -3187,89 +3194,113 @@ print(json.dumps({"stdout": stdout.decode("utf-8", "replace"),
                   "hook_ready": hook_offset is not None, "failure": failure}))
 `
 
-	for _, mode := range []string{"path", "json"} {
-		t.Run(mode, func(t *testing.T) {
-			t.Parallel()
-			repoDir, homeDir := setupTestRepo(t)
-			readyFile := filepath.Join(homeDir, "hook-ready")
-			releaseFile := filepath.Join(homeDir, "hook-release")
-			configDir := filepath.Join(homeDir, ".config", "treehouse")
-			if err := os.MkdirAll(configDir, 0o755); err != nil {
-				t.Fatal(err)
-			}
-			// JSON string quoting is also valid TOML basic-string quoting. The
-			// inner shell quoting preserves spaces and apostrophes in the path.
-			hook, err := json.Marshal("'" + strings.ReplaceAll(waitShellBin, "'", "'\"'\"'") + "'; echo progress-hook-started; exit 7")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte("[hooks]\npost_create = ["+string(hook)+"]\n"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-			defer cancel()
-			args := []string{"-c", terminalReader, treehouseBin, "get", "--lease"}
-			if mode == "json" {
-				args = append(args, "--json")
-			}
-			terminal := exec.CommandContext(ctx, python, args...)
-			terminal.Dir = repoDir
-			terminal.Env = buildEnv(homeDir,
-				"SHELL="+exitShellBin,
-				"TREEHOUSE_TEST_READY="+readyFile,
-				"TREEHOUSE_TEST_RELEASE="+releaseFile,
-			)
-			output, err := terminal.CombinedOutput()
-			if err != nil {
-				// Also release if the outer deadline interrupted the reader.
-				_ = os.WriteFile(releaseFile, nil, 0o644)
-				t.Fatalf("terminal reader failed: %v: %s", err, output)
-			}
-			var result struct {
-				Stdout    string   `json:"stdout"`
-				Stderr    string   `json:"stderr"`
-				ExitCode  int      `json:"exit_code"`
-				Frames    []string `json:"frames"`
-				HookReady bool     `json:"hook_ready"`
-				Failure   string   `json:"failure"`
-			}
-			if err := json.Unmarshal(output, &result); err != nil {
-				t.Fatalf("invalid terminal reader result: %v: %s", err, output)
-			}
-			if result.Failure != "" || !result.HookReady || len(result.Frames) < 2 {
-				t.Errorf("animation did not advance during blocked hook: %s (ready=%v, frames=%q); stderr: %q", result.Failure, result.HookReady, result.Frames, result.Stderr)
-			}
-			if result.ExitCode != 0 {
-				t.Fatalf("get failed (%d): %s", result.ExitCode, result.Stderr)
-			}
-			assertProgressOrder(t, result.Stderr, "🌳 Setting up worktree...", "🌳 Fetching from origin...", "🌳 Creating worktree...", "🌳 Running post-create hooks...", "progress-hook-started\r\n", "🌳 hook command failed:", "🌳 Done.")
-			if strings.Contains(strings.SplitN(result.Stderr, "🌳 Done.", 2)[1], "\r🌳 [") {
-				t.Fatalf("animation continued after Done: %q", result.Stderr)
-			}
-			path := strings.TrimSpace(result.Stdout)
-			if mode == "json" {
-				var lease leaseJSONResult
-				if err := json.Unmarshal([]byte(result.Stdout), &lease); err != nil {
-					t.Fatalf("terminal animation corrupted lease JSON: %v: %q", err, result.Stdout)
+	for _, terminalCase := range []struct {
+		term    string
+		columns int
+		animate bool
+	}{
+		{"xterm-256color", 80, true},
+		{"dumb", 80, false},
+		{"xterm-256color", 10, false},
+		{"xterm-256color", 17, false},
+		{"xterm-256color", 18, true},
+		{"xterm-256color", 0, false},
+	} {
+		for _, mode := range []string{"path", "json"} {
+			t.Run(terminalCase.term+"/"+strconv.Itoa(terminalCase.columns)+"/"+mode, func(t *testing.T) {
+				t.Parallel()
+				repoDir, homeDir := setupTestRepo(t)
+				readyFile := filepath.Join(homeDir, "hook-ready")
+				releaseFile := filepath.Join(homeDir, "hook-release")
+				configDir := filepath.Join(homeDir, ".config", "treehouse")
+				if err := os.MkdirAll(configDir, 0o755); err != nil {
+					t.Fatal(err)
 				}
-				if lease.LeaseID == "" || lease.LeasedAt.IsZero() {
-					t.Fatalf("lease metadata missing: %q", result.Stdout)
+				// JSON string quoting is also valid TOML basic-string quoting. The
+				// inner shell quoting preserves spaces and apostrophes in the path.
+				hook, err := json.Marshal("'" + strings.ReplaceAll(waitShellBin, "'", "'\"'\"'") + "'; echo progress-hook-started; exit 7")
+				if err != nil {
+					t.Fatal(err)
 				}
-				path = lease.Path
-			} else if result.Stdout != path+"\n" {
-				t.Fatalf("terminal animation changed path-only stdout: %q", result.Stdout)
-			}
-			hookPath, err := os.ReadFile(readyFile)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !filepath.IsAbs(path) || path != string(hookPath) {
-				t.Fatalf("stdout path %q differs from hook worktree %q", path, hookPath)
-			}
-			if _, err := os.Stat(filepath.Join(path, ".git")); err != nil {
-				t.Fatalf("stdout did not identify a worktree: %v: %q", err, result.Stdout)
-			}
-		})
+				if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte("[hooks]\npost_create = ["+string(hook)+"]\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+				defer cancel()
+				args := []string{"-c", terminalReader, treehouseBin, "get", "--lease"}
+				if mode == "json" {
+					args = append(args, "--json")
+				}
+				terminal := exec.CommandContext(ctx, python, args...)
+				terminal.Dir = repoDir
+				terminal.Env = buildEnv(homeDir,
+					"TERM="+terminalCase.term,
+					"TREEHOUSE_TEST_COLUMNS="+strconv.Itoa(terminalCase.columns),
+					"TREEHOUSE_TEST_ANIMATE="+strconv.FormatBool(terminalCase.animate),
+					"SHELL="+exitShellBin,
+					"TREEHOUSE_TEST_READY="+readyFile,
+					"TREEHOUSE_TEST_RELEASE="+releaseFile,
+				)
+				output, err := terminal.CombinedOutput()
+				if err != nil {
+					// Also release if the outer deadline interrupted the reader.
+					_ = os.WriteFile(releaseFile, nil, 0o644)
+					t.Fatalf("terminal reader failed: %v: %s", err, output)
+				}
+				var result struct {
+					Stdout    string   `json:"stdout"`
+					Stderr    string   `json:"stderr"`
+					ExitCode  int      `json:"exit_code"`
+					Frames    []string `json:"frames"`
+					HookReady bool     `json:"hook_ready"`
+					Failure   string   `json:"failure"`
+				}
+				if err := json.Unmarshal(output, &result); err != nil {
+					t.Fatalf("invalid terminal reader result: %v: %s", err, output)
+				}
+				if result.Failure != "" || !result.HookReady || (terminalCase.animate && len(result.Frames) < 2) {
+					t.Errorf("unexpected terminal progress: %s (ready=%v, frames=%q); stderr: %q", result.Failure, result.HookReady, result.Frames, result.Stderr)
+				}
+				if !terminalCase.animate {
+					// PTYs normally translate LF to CRLF; only standalone CRs and
+					// escape sequences are terminal controls, not those line endings.
+					plain := strings.ReplaceAll(result.Stderr, "\r\n", "\n")
+					if strings.Contains(plain, "🌳 [") || strings.ContainsAny(plain, "\r\x1b") {
+						t.Errorf("static progress contains a bar or terminal controls: %q", result.Stderr)
+					}
+				}
+				if result.ExitCode != 0 {
+					t.Fatalf("get failed (%d): %s", result.ExitCode, result.Stderr)
+				}
+				assertProgressOrder(t, result.Stderr, "🌳 Setting up worktree...", "🌳 Fetching from origin...", "🌳 Creating worktree...", "🌳 Running post-create hooks...", "progress-hook-started\r\n", "🌳 hook command failed:", "🌳 Done.")
+				if strings.Contains(strings.SplitN(result.Stderr, "🌳 Done.", 2)[1], "\r🌳 [") {
+					t.Fatalf("animation continued after Done: %q", result.Stderr)
+				}
+				path := strings.TrimSpace(result.Stdout)
+				if mode == "json" {
+					var lease leaseJSONResult
+					if err := json.Unmarshal([]byte(result.Stdout), &lease); err != nil {
+						t.Fatalf("terminal animation corrupted lease JSON: %v: %q", err, result.Stdout)
+					}
+					if lease.LeaseID == "" || lease.LeasedAt.IsZero() {
+						t.Fatalf("lease metadata missing: %q", result.Stdout)
+					}
+					path = lease.Path
+				} else if result.Stdout != path+"\n" {
+					t.Fatalf("terminal animation changed path-only stdout: %q", result.Stdout)
+				}
+				hookPath, err := os.ReadFile(readyFile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !filepath.IsAbs(path) || path != string(hookPath) {
+					t.Fatalf("stdout path %q differs from hook worktree %q", path, hookPath)
+				}
+				if _, err := os.Stat(filepath.Join(path, ".git")); err != nil {
+					t.Fatalf("stdout did not identify a worktree: %v: %q", err, result.Stdout)
+				}
+			})
+		}
 	}
 }
 

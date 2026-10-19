@@ -3,6 +3,7 @@ package pool
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -25,10 +26,77 @@ func TestSetupProgressRedirected(t *testing.T) {
 	}
 }
 
+// Each hook stream owns its partial line: a newline on redirected stdout
+// must not allow animation to overwrite an unfinished stderr line (or vice versa).
+func TestSetupProgressIndependentHookStreams(t *testing.T) {
+	for _, partialStderr := range []bool{true, false} {
+		t.Run(fmt.Sprintf("partial-stderr=%v", partialStderr), func(t *testing.T) {
+			var stderr, stdout bytes.Buffer
+			p := &setupProgress{out: &stderr, terminal: true, width: func() int { return 80 }}
+			partial, complete := p.output(&stderr), p.output(&stdout)
+			if !partialStderr {
+				partial, complete = complete, partial
+			}
+			if _, err := partial.Write([]byte("hook-partial")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := complete.Write([]byte("stdout-line\n")); err != nil {
+				t.Fatal(err)
+			}
+			before := stderr.String()
+			p.draw()
+			if stderr.String() != before {
+				t.Fatalf("animation overwrote a partial hook line: before=%q after=%q", before, stderr.String())
+			}
+			if _, err := partial.Write([]byte("-finished\n")); err != nil {
+				t.Fatal(err)
+			}
+			before = stderr.String()
+			p.draw()
+			if stderr.String() == before {
+				t.Fatal("animation did not resume after both hook streams finished their lines")
+			}
+			partialOutput := stderr.String()
+			if !partialStderr {
+				partialOutput = stdout.String()
+			}
+			if !strings.Contains(partialOutput, "hook-partial-finished\n") {
+				t.Fatalf("partial hook output corrupted: %q", partialOutput)
+			}
+		})
+	}
+}
+
+func TestSetupProgressResize(t *testing.T) {
+	var out bytes.Buffer
+	width := 80
+	p := &setupProgress{out: &out, terminal: true, width: func() int { return width }}
+	p.draw()
+	if !strings.Contains(out.String(), "[===         ]") {
+		t.Fatalf("missing initial frame: %q", out.String())
+	}
+	out.Reset()
+	width = 10
+	p.draw()
+	if got, want := out.String(), "\r         \r"; got != want {
+		t.Fatalf("resized clear = %q, want %q without wrapping", got, want)
+	}
+	out.Reset()
+	p.draw()
+	if out.Len() != 0 {
+		t.Fatalf("animation continued in narrow terminal: %q", out.String())
+	}
+	width = 18
+	p.draw()
+	if !strings.Contains(out.String(), "[ ===        ]") {
+		t.Fatalf("animation did not resume in wider terminal: %q", out.String())
+	}
+}
+
 func TestSetupProgressTerminal(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var out bytes.Buffer
-		p := &setupProgress{out: &out, terminal: true}
+		p := &setupProgress{out: &out, terminal: true, width: func() int { return 80 }}
 		snapshot := func() string {
 			p.mu.Lock()
 			defer p.mu.Unlock()
