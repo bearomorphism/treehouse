@@ -3172,7 +3172,7 @@ def pump_until(predicate, description):
                 assert len(message) <= 4096 and message.endswith(b"\n"), "invalid readiness message"
                 event = json.loads(message)
                 stage = event["stage"]
-                assert stage in ("git", "foreground", "child") and stage not in events, event
+                assert stage in ("git", "foreground", "background", "child") and stage not in events, event
                 events[stage], controls[stage] = event, control
                 continue
             try:
@@ -3199,11 +3199,17 @@ try:
     os.environ["TREEHOUSE_TEST_PORT"] = str(server.getsockname()[1])
     helper = os.path.join(os.environ["HOME"], "progress-hook.py")
     with open(helper, "w") as f:
-        f.write('''import json, os, socket, subprocess, sys
+        f.write('''import json, os, signal, socket, subprocess, sys
 stage = sys.argv[1]
+if stage == "fetch":
+    with open("/dev/tty", "r+b", buffering=0) as tty:
+        tty.write(b"Password: ")
+        assert tty.readline() == b"dummy-answer\\n", "missing prompt response"
+    os.execvp("git", ["git", "upload-pack", *sys.argv[2:]])
 if stage == "background":
+    # Survive the controlling terminal's hangup when the CLI session leader exits.
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
     subprocess.Popen([sys.executable, __file__, "child"])
-    sys.exit(0)
 with socket.create_connection(("127.0.0.1", int(os.environ["TREEHOUSE_TEST_PORT"])), timeout=45) as control:
     if stage == "foreground":
         print("progress-hook-stdout")
@@ -3224,19 +3230,32 @@ with socket.create_connection(("127.0.0.1", int(os.environ["TREEHOUSE_TEST_PORT"
         f.write("#!/bin/sh\nexec " + shlex.join([sys.executable, helper, "git"]) + "\n")
     os.chmod(checkout, 0o755)
     subprocess.run(["git", "config", "core.hooksPath", hook_dir], check=True, timeout=5)
+    subprocess.run(["git", "config", "remote.origin.uploadpack",
+                    shlex.join([sys.executable, helper, "fetch"])], check=True, timeout=5)
     if animate:
         config_dir = os.path.join(os.environ["HOME"], ".config", "treehouse")
         os.makedirs(config_dir)
         commands = [shlex.join([sys.executable, helper, mode]) for mode in ("foreground", "background")]
         with open(os.path.join(config_dir, "config.toml"), "w") as f:
             f.write("[hooks]\npost_create = " + json.dumps(commands) + "\n")
+    def controlling_terminal():
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
     proc = subprocess.Popen([binary, "get", "--lease", "--json"], stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=slave, start_new_session=True)
+                            stdout=subprocess.PIPE, stderr=slave, preexec_fn=controlling_terminal)
     os.close(slave)
     slave = None
     stdout_fd = proc.stdout.fileno()
     streams = {master: stderr, stdout_fd: stdout}
+    pump_until(lambda: b"Password: " in stderr, "fetch prompt on controlling terminal")
+    assert not stdout and done not in stderr, "output completed before answering fetch prompt"
+    os.write(master, b"dummy-answer\n")
     pump_until(lambda: "git" in events, "Git checkout readiness")
+    fetch_region = plain(stderr).split(tree + b" Creating worktree...\n")[0]
+    assert tree + b" Fetching from origin...\n" in fetch_region, fetch_region
+    assert b"Password: " in fetch_region, fetch_region
+    assert all(control not in fetch_region for control in (b"\r", b"\x1b")), fetch_region
     git_offset = len(stderr)
     if animate:
         pump_until(lambda: len(set(pattern.findall(stderr[git_offset:]))) >= 2,
@@ -3250,7 +3269,8 @@ with socket.create_connection(("127.0.0.1", int(os.environ["TREEHOUSE_TEST_PORT"
             assert events["foreground"][stream] == slave_name, events["foreground"]
         assert not stdout and done not in stderr, "output completed before releasing foreground hook"
         controls["foreground"].sendall(b"x")
-        pump_until(lambda: "child" in events, "background child readiness")
+        pump_until(lambda: "child" in events and "background" in events, "background child readiness")
+        controls["background"].sendall(b"x")
         # PTY EOF cannot mark completion: the child must still hold both streams.
         pump_until(lambda: stdout_fd not in streams and done in stderr,
                    "CLI stdout EOF and Done while the child is blocked")

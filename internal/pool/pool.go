@@ -396,9 +396,9 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 	fmt.Fprintf(os.Stderr, "🌳 Setting up worktree...\n")
 	progress := newSetupProgress()
 	if !opts.skipFetch && vcs.HasRemote(repoRoot, "origin") {
-		if err := progress.run("Fetching from origin...", func() error {
-			return vcs.Fetch(repoRoot)
-		}); err != nil {
+		// Git/SSH can prompt through the controlling terminal, even with redirected stdin.
+		fmt.Fprintln(os.Stderr, "🌳 Fetching from origin...")
+		if err := vcs.Fetch(repoRoot); err != nil {
 			return LeaseInfo{}, fmt.Errorf("fetch failed: %w", err)
 		}
 	}

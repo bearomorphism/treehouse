@@ -192,11 +192,11 @@ by `🌳 Done.` when setup finishes. Steps that are skipped are not announced (f
 example, fetching with `--no-fetch` or without an origin remote). These messages
 also appear with `get --lease` and `get --lease --json`; stdout remains the path
 or JSON result. Terminal stderr also shows an animated indeterminate bar during
-Git setup operations (fetch, create, and reuse), with no percentage or ETA;
-redirected, dumb, or too-narrow terminals retain plain step messages. Animation
-stops before post-create hooks to preserve their terminal output, streaming, and
-background-process behavior. Hook failures remain warnings and do not fail
-acquisition.
+worktree creation and reuse, with no percentage or ETA; redirected, dumb, or
+too-narrow terminals retain plain step messages. Fetch always shows a plain step
+to leave credential/SSH prompts visible. Animation stops before post-create hooks
+to preserve their terminal output, streaming, and background-process behavior.
+Hook failures remain warnings and do not fail acquisition.
 
 ### Flags
 
