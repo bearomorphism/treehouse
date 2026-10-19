@@ -395,6 +395,7 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 
 	fmt.Fprintf(os.Stderr, "🌳 Setting up worktree...\n")
 	if !opts.skipFetch && vcs.HasRemote(repoRoot, "origin") {
+		fmt.Fprintln(os.Stderr, "🌳 Fetching from origin...")
 		if err := vcs.Fetch(repoRoot); err != nil {
 			return LeaseInfo{}, fmt.Errorf("fetch failed: %w", err)
 		}
@@ -527,6 +528,7 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 			if !wt.SeedInventoryKnown {
 				seededPaths = nil
 			}
+			fmt.Fprintln(os.Stderr, "🌳 Reusing worktree...")
 			if err := vcs.ResetWorktreeToRefWithSeededPaths(wt.Path, resetRef, head, true, seededPaths); err != nil {
 				continue
 			}
@@ -678,6 +680,7 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 			}
 		}
 
+		fmt.Fprintln(os.Stderr, "🌳 Creating worktree...")
 		if err := vcs.AddWorktree(repoRoot, wtPath, branch); err != nil {
 			return fmt.Errorf("failed to create worktree: %w", err)
 		}
@@ -808,9 +811,11 @@ func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts a
 	if err != nil {
 		return LeaseInfo{}, err
 	}
-	if runPostCreate {
+	if runPostCreate && len(postCreate) > 0 {
+		fmt.Fprintln(os.Stderr, "🌳 Running post-create hooks...")
 		hooks.Run(postCreate, acquired.Path, opts.hookStdout, opts.hookStderr)
 	}
+	fmt.Fprintln(os.Stderr, "🌳 Done.")
 
 	return acquired, nil
 }
